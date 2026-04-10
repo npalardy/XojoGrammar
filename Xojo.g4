@@ -253,6 +253,7 @@ statement
     | usingStatement NEWLINE+
     | whileStatement NEWLINE+
     | comment NEWLINE+
+    | label NEWLINE+
     ;
 
 // ============================================================================
@@ -342,20 +343,20 @@ propertyDeclaration
     ; 
 
 instanceComputedProperty
-    : scope? PROPERTY+ IDENTIFIER AS fqName NEWLINE+  
+    : scope? PROPERTY IDENTIFIER AS fqName NEWLINE+  
 //    `Get`                                       `Get`    <<<< MUST be the identifier `Get`
-      IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+
+      (IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+)?
 //    `Set`                                       `Set`    <<<< MUST be the identifier `Set`
-      IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+
+      (IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+)?
       END PROPERTY NEWLINE+
     ;
 
 sharedComputedProperty
-    : scope? SHARED PROPERTY+ IDENTIFIER AS fqName NEWLINE+  
+    : scope? SHARED PROPERTY IDENTIFIER AS fqName NEWLINE+  
 //    `Get`                                      `Get`    <<<< MUST be the identifier `Get`
-      IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+
+      (IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+)?
 //    `Set`                                      `Set`    <<<< MUST be the IDENT `Set`
-      IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+
+      (IDENTIFIER NEWLINE+ statement* NEWLINE+ END IDENTIFIER NEWLINE+)?
       END PROPERTY NEWLINE+
     ;
 
@@ -431,9 +432,13 @@ forNextStatement
     ;
 
 gotoStatement
-    : GOTO label=IDENTIFIER comment?
+    : GOTO IDENTIFIER comment?
     ;
 
+label
+	: IDENTIFIER ':'
+	;
+	
 ifStatement
     // expr has to be a BOOLEAN expr
     : IF ifCondition=expr THEN singleLineStatement (ELSE singleLineStatement)?
@@ -465,8 +470,7 @@ raiseStatement
     ;
 
 raiseEventExpr
-    : RAISE_EVENT IDENTIFIER #RaiseEventExprNoArgs
-    | RAISE_EVENT IDENTIFIER '(' ')' #RaiseEventExprNoArgs
+    : RAISE_EVENT IDENTIFIER ('(' ')')? #RaiseEventExprNoArgs
     | RAISE_EVENT IDENTIFIER '(' arguments ')' #RaiseEventExprWithArgs
     ;
 
@@ -580,9 +584,78 @@ expr
     | primary #PrimaryExpression
     ;
 
+// ============================================================================
+// CALL EXPRESSIONS
+// ============================================================================
+// Xojo supports two equivalent calling conventions:
+//
+//   foo(t)     parenthesised — unambiguous
+//   foo t      no-parens — arguments follow the name directly, no parens
+//
+// These are semantically identical. The no-parens form is only valid as a
+// statement (i.e. the result is discarded), never as a sub-expression, because
+// allowing it inside expr would make the grammar infinitely ambiguous:
+//   foo bar baz   →  foo(bar(baz)) ?  or  foo(bar), baz ?
+//
+// To prevent this, the no-parens form uses `bareArguments` rather than
+// `arguments`. `bareArguments` is a comma-separated list of `bareExpr` values,
+// where `bareExpr` is like `expr` but explicitly excludes the no-parens
+// `callExpr` alternative. This keeps each argument unambiguously bounded by
+// the comma or end-of-line that follows it.
+//
+// Parenthesised calls may appear anywhere an expr is valid and use the
+// unrestricted `arguments` rule, since the closing `)` provides a clear
+// boundary.
+
 callExpr
-    : fqName arguments? // For crazy people who don't use parentheses for a call...
-    | fqName (LPAREN arguments? RPAREN)? ('.' expr)?
+    : fqName '(' arguments? ')'            #ParenCall         // foo()  foo(a, b)
+    | fqName '(' arguments? ')' '.' expr   #ParenCallChained  // foo(a).bar
+    | fqName bareArguments                 #BareCall           // foo a, b  (statement position only)
+    ;
+
+// Arguments for parenthesised calls. Each argument is a full `expr`, which
+// may itself contain nested callExprs of either form.
+arguments
+    : expr (COMMA expr)*
+    ;
+
+// Arguments for the no-parens call form. Each argument is a `bareExpr` so
+// that a bare identifier following the callee is always consumed as an
+// argument to this call, never as a separate statement.
+bareArguments
+    : bareExpr (COMMA bareExpr)*
+    ;
+
+// An expression that is safe to use as a no-parens argument: the same as
+// `expr` but without the no-parens `callExpr` alternative. This means a bare
+// name used as an argument is always a primary (variable/property reference),
+// never silently interpreted as another no-parens call.
+bareExpr
+    : raiseEventExpr
+    | ADDRESS_OF fqName
+    | bareExpr IS bareExpr
+    | bareExpr ISA fqName
+    | bareExpr CARET bareExpr
+    | bareUnary
+    | bareExpr STAR bareExpr
+    | bareExpr FORWARD_SLASH bareExpr
+    | bareExpr BACKSLASH bareExpr
+    | bareExpr MOD bareExpr
+    | bareExpr PLUS bareExpr
+    | bareExpr MINUS bareExpr
+    | bareExpr (EQUALS | GREATER | LESS | GREATER_EQUAL | LESS_EQUAL | NOT_EQUAL) bareExpr
+    | bareExpr AND bareExpr
+    | bareExpr (OR | XOR) bareExpr
+    | bareExpr ':' bareExpr
+    | fqName '(' arguments? ')'            // parenthesised calls ARE allowed inside bare args
+    | fqName '(' arguments? ')' '.' expr
+    | primary
+    ;
+
+bareUnary
+    : MINUS bareExpr
+    | NOT bareExpr
+    | NEW fqName ('(' arguments ')')?
     ;
 
 unary
@@ -670,11 +743,6 @@ arrayParam
     :  (IDENTIFIER|ME) '(' (',')* ')' AS fqName
     ;
 
-// An argument is an expression used when calling an array, function or sub.
-arguments
-    : expr (COMMA expr)*
-    ;
-
 arrayDecl
     : simplevarDecl '(' ( MINUS? number (',' MINUS? number)* )? ')'
     ;
@@ -696,6 +764,29 @@ paramList
 // WHITESPACE
 WHITESPACE : (' ' | '\t') -> skip;
 NEWLINE : ('\r'? '\n' | '\r');
+
+// LINE CONTINUATION
+// An underscore at the end of a line (with optional trailing whitespace, and
+// optionally followed by a comment) continues the logical line onto the next.
+// The token is skipped entirely — the parser never sees it.
+//
+// Legal forms:
+//   someCode _              (bare underscore, end of line)
+//   someCode _ ' remark     (apostrophe comment after underscore)
+//   someCode _ // remark    (double-slash comment after underscore)
+//   someCode _ REM remark   (REM comment after underscore)
+//
+// IMPORTANT: This rule must appear before the IDENTIFIER rule in the lexer
+// because '_' is also a valid identifier character. ANTLR gives priority to
+// the rule defined first when both could match.
+LINE_CONTINUATION
+    : '_' (' ' | '\t')* (
+          '\'' ~('\r' | '\n')*        // apostrophe comment
+        | '//' ~('\r' | '\n')*        // double-slash comment
+        | R E M ' ' ~('\r' | '\n')*  // REM comment (must have space after REM)
+        )?
+      ('\r'? '\n' | '\r') -> skip
+    ;
 
 // COMMENTS
 COMMENT_APOSTROPHE
@@ -743,7 +834,7 @@ fragment DIGIT : [0-9];
 fragment HEX : (DIGIT | [A-Fa-f]);
 
 DOUBLE : DIGIT+ '.' DIGIT+ (E DIGIT+)?;
-INTEGER : (PLUS|MINUS)? DIGIT+ (E DIGIT+)?;
+INTEGER : DIGIT+ (E DIGIT+)?;
 
 BINARY_LITERAL : '&' B [0-1]+;
 HEX_LITERAL : '&' H HEX+;
@@ -752,13 +843,12 @@ OCTAL_LITERAL : '&' O [0-7]+;
 // STRINGS
 fragment ESCAPED_QUOTE : '""';
 
-UNICODE : '&' H HEX+;
 STRING : '"' (~[\r\n"] | ESCAPED_QUOTE)* '"';
 
 // OTHER LITERALS
 COLOR_LITERAL: '&' C HEX+;
 BOOLEAN_LITERAL : T R U E | F A L S E;
-UNICODE_LITERAL : '&' U DIGIT+;
+UNICODE_LITERAL : '&' U HEX+;
 
 // COMPILER KEYWORDS
 BAD: '#' B A D;
